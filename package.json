@@ -1,12 +1,12 @@
 {
   "name": "@titah/extension-diff",
-  "version": "0.1.0",
-  "description": "Diff panel for Titah — git diff + session changes, tabbed view. Right side.",
+  "version": "0.2.0",
+  "description": "Editor-style git diff panel for Titah — line numbers, colours, and block-a-range-into-the-prompt.",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=22.6",
-    "titah": "^0.4.0"
+    "titah": "^0.5.0"
   },
   "titah": {
     "panel": "./dist/panel.js"
@@ -22,7 +22,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "titah-code": "^0.4.0",
+    "titah-code": "^0.7.0",
     "typescript": "^5.9.0"
   },
   "keywords": [

@@ -1,21 +1,24 @@
 import type { ExtensionFactory, View, ViewRow } from "titah-code/extension"
 import { getGitDiff, isGitRepo } from "./git-diff.ts"
-import { createSessionTracker } from "./session-tracker.ts"
+import { parseDiff, type DiffRow } from "./diff-parse.ts"
+import { drawRow, gutterDigits } from "./render-diff.ts"
+import { HINT, moveCursor, planView, visualHint, type PlanRow } from "./layout.ts"
 import {
-  TABS,
-  type TabId,
-  type TabRow,
-  nextTab,
-  prevTab,
-  moveCursor,
-  planTab,
-  truncateEnd,
-} from "./tabs.ts"
+  selectedCount,
+  selectionRange,
+  toReferences,
+  type Selection,
+} from "./selection.ts"
 
 /**
- * Panel diff untuk Titah — tabbed view: Git Diff | Session Changes.
+ * Panel diff untuk Titah — tampilan bergaya editor, dengan seleksi baris.
  *
  * Ditulis HANYA dengan `titah-code/extension`. Tidak ada akses ke internal Titah.
+ *
+ * Yang membedakannya dari panel diff biasa: baris bisa di-block (`v`, lalu `↑↓`)
+ * dan dikirim ke prompt utama (`y`) sebagai referensi `@path:awal-akhir`. Agent
+ * membaca berkasnya sendiri dari situ, jadi yang berpindah cuma alamatnya —
+ * seratus baris yang di-block tidak jadi seratus baris di prompt.
  */
 
 interface Options {
@@ -24,129 +27,135 @@ interface Options {
   showWhitespace?: boolean
 }
 
-const EMPTY_LABELS: Record<TabId, string> = {
-  git: "clean",
-  session: "no session changes",
-}
-
 const factory: ExtensionFactory = ({ cwd, options }) => {
   const settings = options as Options
   const gitDiffLimit = Math.max(1, settings.gitDiffLimit ?? 200)
   const contextLines = Math.max(0, settings.contextLines ?? 3)
   const showWhitespace = settings.showWhitespace ?? false
 
-  let activeTab: TabId = "git"
-  const cursors: Record<TabId, number> = { git: 0, session: 0 }
-  let contentLines: Record<TabId, number> = { git: 0, session: 0 }
-  let drawn: TabRow[] = []
+  let cursor = 0
+  let selection: Selection | undefined
+  let rows: DiffRow[] = []
+  let drawn: PlanRow[] = []
+  let emptyLabel = "clean"
 
-  const sessionTracker = createSessionTracker()
+  /*
+   * Sidik jari isi diff yang sedang ditandai.
+   *
+   * Seleksi adalah sepasang INDEKS, dan indeks hanya berarti selama daftarnya
+   * tidak berubah. Panel ini di-refresh host pada empat momen — salah satunya
+   * akhir giliran agent, yang justru saat isi diff paling mungkin berubah.
+   * Menyimpan seleksi melewati perubahan itu berarti `y` mengirim referensi ke
+   * baris yang sudah bukan baris itu lagi, tanpa satu pun tanda di layar.
+   *
+   * Yang TIDAK boleh dilakukan adalah membuang seleksi di setiap render:
+   * menekan `↓` saat visual mode menyala juga meminta render, jadi seleksinya
+   * akan mati satu tombol sesudah dibuat.
+   */
+  let fingerprint = ""
 
   return {
     title: "Diff",
     side: "right",
     key: "<leader>d",
 
-    async render({ signal, width, rows }): Promise<View> {
-      // Git diff
-      let gitLines: string[] = []
+    async render({ signal, width, rows: height }): Promise<View> {
+      let lines: string[] = []
       if (await isGitRepo(cwd, signal)) {
-        gitLines = await getGitDiff({
-          cwd,
-          signal,
-          contextLines,
-          showWhitespace,
-          limit: gitDiffLimit,
-        })
+        lines = await getGitDiff({ cwd, signal, contextLines, showWhitespace, limit: gitDiffLimit })
+        emptyLabel = "clean"
+      } else {
+        emptyLabel = "not a git repo"
       }
 
-      // Session diffs
-      const sessionDiffs = sessionTracker.getAllDiffs()
-      const sessionLines: string[] = []
-      for (const diff of sessionDiffs.values()) {
-        sessionLines.push(...diff.split("\n"))
+      const next = lines.join("\n")
+      if (next !== fingerprint) {
+        fingerprint = next
+        selection = undefined
       }
 
-      contentLines = {
-        git: gitLines.length,
-        session: sessionLines.length,
-      }
+      rows = parseDiff(lines)
+      cursor = moveCursor(cursor, 0, rows.length)
 
-      // Clamp cursor
-      cursors[activeTab] = moveCursor(cursors[activeTab], 0, contentLines[activeTab])
-
-      const innerWidth = Math.max(1, width - 2)
-
-      const currentLines = activeTab === "git" ? gitLines : sessionLines
-      drawn = planTab({
-        rows,
-        activeTab,
-        cursor: cursors[activeTab],
-        contentLines: contentLines[activeTab],
-        content: currentLines,
-        emptyLabel: EMPTY_LABELS[activeTab],
+      const marked = selection === undefined ? undefined : selectionRange(selection)
+      drawn = planView({
+        rows: height,
+        cursor,
+        contentLines: rows.length,
+        ...(marked === undefined ? {} : { selection: marked }),
+        emptyLabel,
+        hint: selection === undefined ? HINT : visualHint(selectedCount(selection)),
       })
 
-      return { kind: "rows", rows: drawn.map((row) => drawRow(row, innerWidth)) }
+      const digits = gutterDigits(rows, width)
+      return { kind: "rows", rows: drawn.map((row) => draw(row, rows, width, digits)) }
     },
 
     onKey({ key }) {
-      if (key === "tab") {
-        activeTab = nextTab(activeTab)
-        return { refresh: true }
-      }
-      if (key === "backtab" || key === "shift+tab") {
-        activeTab = prevTab(activeTab)
-        return { refresh: true }
-      }
       if (key === "up" || key === "down") {
-        const delta = key === "up" ? -1 : 1
-        cursors[activeTab] = moveCursor(cursors[activeTab], delta, contentLines[activeTab])
+        cursor = moveCursor(cursor, key === "up" ? -1 : 1, rows.length)
+        // Kepala seleksi mengikuti kursor; jangkarnya tinggal di tempat.
+        if (selection !== undefined) selection = { anchor: selection.anchor, head: cursor }
         return { refresh: true }
       }
+
+      if (key === "v") {
+        // Satu tombol untuk menyalakan DAN membatalkan, karena `escape` tidak
+        // pernah sampai ke sini — host memakainya untuk melepas fokus panel.
+        selection = selection === undefined ? { anchor: cursor, head: cursor } : undefined
+        return { refresh: true }
+      }
+
+      if (key === "y") {
+        /*
+         * Tanpa seleksi, `y` mengirim baris di bawah kursor.
+         *
+         * Mem-block satu baris untuk mengirim satu baris adalah tiga tombol
+         * untuk pekerjaan satu tombol, dan satu baris adalah kasus yang paling
+         * sering: "apa ini", "kenapa baris ini berubah".
+         */
+        const { from, to } = selection === undefined
+          ? { from: cursor, to: cursor }
+          : selectionRange(selection)
+
+        const text = toReferences(rows, from, to)
+        selection = undefined
+        // Judul berkas dan header hunk tidak punya nomor untuk dirujuk. Diam
+        // lebih baik daripada menyisipkan sesuatu yang harus user hapus lagi.
+        if (text === "") return { refresh: true }
+        return { prompt: { text }, refresh: true }
+      }
+
       if (key === "r") return { refresh: true }
       return undefined
     },
 
     onClick({ row }) {
       const target = drawn[row]
-      if (target === undefined) return undefined
+      if (target === undefined || target.kind !== "content") return undefined
 
-      // Click on tab switches to it
-      if (target.kind === "tab") {
-        if (target.tab === activeTab) return undefined
-        activeTab = target.tab
-        return { refresh: true }
-      }
-      // Click on content line moves cursor
-      if (target.kind === "content") {
-        // Find the actual index in the content (accounting for offset)
-        // Since we don't have offset in the row, we'd need to track it
-        // For now, just refresh - cursor movement via click is secondary
-        return { refresh: true }
-      }
-      return undefined
+      // Inilah yang dulu tidak bisa dilakukan: `row` adalah indeks baris
+      // TERGAMBAR, dan `index` yang dibawa rencana barislah yang menerjemahkannya
+      // ke indeks data.
+      cursor = target.index
+      if (selection !== undefined) selection = { anchor: selection.anchor, head: cursor }
+      return { refresh: true }
     },
   }
 }
 
-/**
- * Render TabRow ke ViewRow.
- */
-function drawRow(row: TabRow, width: number): ViewRow {
-  switch (row.kind) {
-    case "tab": {
-      const text = row.active ? `▸ ${row.title} ◂` : `  ${row.title}  `
-      return row.active ? { text, color: "cyan" } : { text, dim: true }
+/** Menerjemahkan satu baris rencana jadi satu `ViewRow`. */
+function draw(plan: PlanRow, rows: DiffRow[], width: number, digits: number): ViewRow {
+  switch (plan.kind) {
+    case "content": {
+      const row = rows[plan.index]
+      if (row === undefined) return { text: "" }
+      return drawRow(row, { width, digits, cursor: plan.cursor, selected: plan.selected })
     }
-    case "content":
-      return row.cursor
-        ? { text: `› ${truncateEnd(row.text, width - 2)}`, selected: true }
-        : { text: `  ${truncateEnd(row.text, width - 2)}` }
     case "empty":
-      return { text: `  ${row.text}`, dim: true }
+      return { text: `  ${plan.text}`, dim: true }
     case "hint":
-      return { text: row.text, dim: true }
+      return { text: plan.text, dim: true }
   }
 }
 
